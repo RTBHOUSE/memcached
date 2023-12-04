@@ -107,7 +107,7 @@ crawler_module_t active_crawler_mod;
 enum crawler_run_type active_crawler_type;
 
 static crawler crawlers[LARGEST_ID];
-
+static uint8_t crawled_sids[LARGEST_ID];
 static int crawler_count = 0;
 static volatile int do_run_lru_crawler_thread = 0;
 static int lru_crawler_initialized = 0;
@@ -391,15 +391,20 @@ static int lru_crawler_write(crawler_client_t *c) {
     return 0;
 }
 
-static void lru_crawler_class_done(int i) {
-    crawlers[i].it_flags = 0;
+static void lru_crawler_class_done(int i, int sid) {
+    // Replace done sid with sid from tail of the list
+    crawled_sids[i] = crawled_sids[crawler_count-1];
+    // Effectively "remove" (ignore) the element from the tail of the
+    // crawled_sids list that is now a duplicate of crawled_sids[i]
     crawler_count--;
-    do_item_unlinktail_q((item *)&crawlers[i]);
-    do_item_stats_add_crawl(i, crawlers[i].reclaimed,
-            crawlers[i].unfetched, crawlers[i].checked);
-    pthread_mutex_unlock(&lru_locks[i]);
+
+    crawlers[sid].it_flags = 0;
+    do_item_unlinktail_q((item *)&crawlers[sid]);
+    do_item_stats_add_crawl(sid, crawlers[sid].reclaimed,
+            crawlers[sid].unfetched, crawlers[sid].checked);
+    pthread_mutex_unlock(&lru_locks[sid]);
     if (active_crawler_mod.mod->doneclass != NULL)
-        active_crawler_mod.mod->doneclass(&active_crawler_mod, i);
+        active_crawler_mod.mod->doneclass(&active_crawler_mod, sid);
 }
 
 // ensure we build the buffer a little bit to cut down on poll/write syscalls.
@@ -497,31 +502,30 @@ static void *item_crawler_thread(void *arg) {
         item *search = NULL;
         void *hold_lock = NULL;
 
-        for (i = POWER_SMALLEST; i < LARGEST_ID; i++) {
-            if (crawlers[i].it_flags != 1) {
-                continue;
-            }
+        for (i = 0; i < crawler_count; i++) {
+            uint8_t sid = crawled_sids[i];
 
             if (active_crawler_mod.c.c != NULL) {
                 crawler_client_t *c = &active_crawler_mod.c;
                 if (c->buflen - c->bufused < LRU_CRAWLER_MINBUFSPACE) {
                     int ret = lru_crawler_write(c);
                     if (ret != 0) {
-                        lru_crawler_class_done(i);
+                        lru_crawler_class_done(i, sid);
                         continue;
                     }
                 }
             } else if (active_crawler_mod.mod->needs_client) {
-                lru_crawler_class_done(i);
+                lru_crawler_class_done(i, sid);
                 continue;
             }
-            pthread_mutex_lock(&lru_locks[i]);
-            search = do_item_crawl_q((item *)&crawlers[i]);
+            pthread_mutex_lock(&lru_locks[sid]);
+            search = do_item_crawl_q((item *)(&crawlers[sid]));
+
             if (search == NULL ||
-                (crawlers[i].remaining && --crawlers[i].remaining < 1)) {
+                (crawlers[sid].remaining && --crawlers[sid].remaining < 1)) {
                 if (settings.verbose > 2)
-                    fprintf(stderr, "Nothing left to crawl for %d\n", i);
-                lru_crawler_class_done(i);
+                    fprintf(stderr, "Nothing left to crawl for %d\n", sid);
+                lru_crawler_class_done(i, sid);
                 continue;
             }
             uint32_t hv = hash(ITEM_key(search), search->nkey);
@@ -529,7 +533,7 @@ static void *item_crawler_thread(void *arg) {
              * other callers can incr the refcount
              */
             if ((hold_lock = item_trylock(hv)) == NULL) {
-                pthread_mutex_unlock(&lru_locks[i]);
+                pthread_mutex_unlock(&lru_locks[sid]);
                 continue;
             }
             /* Now see if the item is refcount locked */
@@ -537,24 +541,24 @@ static void *item_crawler_thread(void *arg) {
                 refcount_decr(search);
                 if (hold_lock)
                     item_trylock_unlock(hold_lock);
-                pthread_mutex_unlock(&lru_locks[i]);
+                pthread_mutex_unlock(&lru_locks[sid]);
                 continue;
             }
 
-            crawlers[i].checked++;
+            crawlers[sid].checked++;
             /* Frees the item or decrements the refcount. */
             /* Interface for this could improve: do the free/decr here
              * instead? */
             if (!active_crawler_mod.mod->needs_lock) {
-                pthread_mutex_unlock(&lru_locks[i]);
+                pthread_mutex_unlock(&lru_locks[sid]);
             }
 
-            active_crawler_mod.mod->eval(&active_crawler_mod, search, hv, i);
+            active_crawler_mod.mod->eval(&active_crawler_mod, search, hv, sid);
 
             if (hold_lock)
                 item_trylock_unlock(hold_lock);
             if (active_crawler_mod.mod->needs_lock) {
-                pthread_mutex_unlock(&lru_locks[i]);
+                pthread_mutex_unlock(&lru_locks[sid]);
             }
 
             if (crawls_persleep-- <= 0 && settings.lru_crawler_sleep) {
@@ -656,10 +660,19 @@ int start_item_crawler_thread(void) {
  */
 static int do_lru_crawler_start(uint32_t id, uint32_t remaining) {
     uint32_t sid = id;
+    bool already_started = false;
     int starts = 0;
+    int i;
 
     pthread_mutex_lock(&lru_locks[sid]);
-    if (crawlers[sid].it_flags == 0) {
+
+    for (i = 0; i < crawler_count; i++) {
+        if (crawled_sids[i] == sid) {
+            already_started = true;
+        }
+    }
+
+    if (!already_started) {
         if (settings.verbose > 2)
             fprintf(stderr, "Kicking LRU crawler off for LRU %u\n", sid);
         crawlers[sid].nbytes = 0;
@@ -685,9 +698,11 @@ static int do_lru_crawler_start(uint32_t id, uint32_t remaining) {
         crawlers[sid].unfetched = 0;
         crawlers[sid].checked = 0;
         do_item_linktail_q((item *)&crawlers[sid]);
+        crawled_sids[crawler_count] = sid;
         crawler_count++;
         starts++;
     }
+
     pthread_mutex_unlock(&lru_locks[sid]);
     return starts;
 }
